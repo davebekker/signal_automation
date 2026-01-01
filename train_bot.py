@@ -1,115 +1,99 @@
+import json
 import asyncio
 import aiohttp
 import os
 import logging
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from dotenv import load_dotenv
+
 load_dotenv()
-# --- Configuration ---
-LDB_TOKEN = os.getenv("LDB_TOKEN")
-SOAP_URL = 'https://lite.realtime.nationalrail.co.uk/OpenLDBWS/ldb12.asmx'
 
 class TrainBot:
     def __init__(self):
-        # Format: {"17:45": "On time"}
         self.ldb_token = os.getenv("LDB_TOKEN")
-        self.crs = os.getenv("DEFAULT_CRS")
-        #print(self.ldb_token)
-        self.subscriptions = {}
+        self.default_crs = os.getenv("DEFAULT_CRS", "NEM")
+        self.current_context_crs = self.default_crs
+        # Subscriptions store (time, station, last_status, last_platform)
+        self.subscriptions = {} 
+        self.stations_file = "stations.json"
+        self.stations = self.load_stations()
+        
         if not self.ldb_token:
-            logging.error("TrainBot: LDB_TOKEN not found in environment variables.")
+            logging.error("TrainBot: LDB_TOKEN not found.")
 
-    def get_soap_payload(self, crs='NEM'):
-        print(self.ldb_token)
-        return f"""<?xml version="1.0" encoding="utf-8"?>
-<soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope"
-               xmlns:typ="http://thalesgroup.com/RTTI/2013-11-28/Token/types"
+    def load_stations(self):
+        """Loads shortcuts from JSON. survive restarts."""
+        if os.path.exists(self.stations_file):
+            try:
+                with open(self.stations_file, 'r') as f:
+                    return json.load(f)
+            except: pass
+        return {"home": "NEM", "work": "WAT"}
+
+    def save_stations(self):
+        with open(self.stations_file, 'w') as f:
+            json.dump(self.stations, f, indent=4)
+
+    async def fetch_trains(self, crs, filter_crs=None):
+        """Official Thales Source with filtering and wildcard XML parsing."""
+        url = 'https://lite.realtime.nationalrail.co.uk/OpenLDBWS/ldb12.asmx'
+        headers = {'Content-Type': 'text/xml; charset=utf-8'}
+        
+        filter_tag = f"<ldb:filterCrs>{filter_crs}</ldb:filterCrs><ldb:filterType>to</ldb:filterType>" if filter_crs else ""
+        
+        payload = f"""<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope" 
+               xmlns:typ="http://thalesgroup.com/RTTI/2013-11-28/Token/types" 
                xmlns:ldb="http://thalesgroup.com/RTTI/2021-11-01/ldb/">
-    <soap12:Header><typ:AccessToken><typ:TokenValue>{self.ldb_token}</typ:TokenValue></typ:AccessToken></soap12:Header>
-    <soap12:Body>
+    <soap:Header><typ:AccessToken><typ:TokenValue>{self.ldb_token}</typ:TokenValue></typ:AccessToken></soap:Header>
+    <soap:Body>
         <ldb:GetDepartureBoardRequest>
-            <ldb:numRows>10</ldb:numRows>
-            <ldb:crs>{crs}</ldb:crs>
+            <ldb:numRows>10</ldb:numRows><ldb:crs>{crs}</ldb:crs>{filter_tag}
         </ldb:GetDepartureBoardRequest>
-    </soap12:Body>
-</soap12:Envelope>"""
+    </soap:Body>
+</soap:Envelope>"""
 
-    def extract_text(self, xml, start_tag, end_tag):
-        try:
-            start = xml.find(start_tag) + len(start_tag)
-            end = xml.find(end_tag, start)
-            return xml[start:end].strip()
-        except:
-            return None
-
-    async def fetch_trains(self, crs='NEM'):
-        headers = {
-            'Content-Type': 'application/soap+xml; charset=utf-8',
-            'SOAPAction': 'http://thalesgroup.com/RTTI/2021-11-01/ldb/GetDepartureBoard'
-        }
         async with aiohttp.ClientSession() as session:
-            async with session.post(SOAP_URL, data=self.get_soap_payload(crs), headers=headers) as resp:
-                text = await resp.text()
-                #print(text)
-                services = []
-                cursor = 0
-                while True:
-                    start = text.find("<lt8:service", cursor)
-                    if start == -1: break
-                    end = text.find("</lt8:service>", start) + 14
-                    services.append(text[start:end])
-                    cursor = end
-                
-                results = []
-                for s in services:
-                    results.append({
-                        "std": self.extract_text(s, "<lt4:std>", "</lt4:std>"),
-                        "etd": self.extract_text(s, "<lt4:etd>", "</lt4:etd>"),
-                        "dest": self.extract_text(s, "<lt4:locationName>", "</lt4:locationName>")
-                    })
-                return results
+            try:
+                async with session.post(url, data=payload, headers=headers) as resp:
+                    if resp.status != 200: return []
+                    root = ET.fromstring(await resp.text())
+                    services = []
+                    for service in root.findall('.//{*}service'):
+                        std = service.findtext('.//{*}std')
+                        etd = service.findtext('.//{*}etd')
+                        plat = service.findtext('.//{*}platform') or "TBC"
+                        # Specific path for 'True' destination at terminus stations
+                        dest_node = service.find('.//{*}destination/{*}location/{*}locationName')
+                        dest = dest_node.text if dest_node is not None else "Unknown"
+                        services.append({'std': std, 'etd': etd, 'dest': dest, 'plat': plat})
+                    return services
+            except Exception as e:
+                logging.error(f"Fetch Error: {e}")
+                return []
 
-    # FIXED: Now a method using 'self' and accepting a callback for alerts
     async def monitor_subscriptions(self, alert_callback):
-        """Background loop to check watched trains and auto-clean departed ones."""
+        """Background loop monitoring multiple stations at once."""
         while True:
             try:
-                # Create a list of keys to remove to avoid 'dictionary changed size during iteration' error
                 to_remove = []
-
-                if self.subscriptions:
-                    trains = await self.fetch_trains(self.crs)
-                    
-                    for time_target, last_status in self.subscriptions.items():
-                        match = next((t for t in trains if t['std'] == time_target), None)
-                        
+                # Group by station to be efficient
+                stations_to_check = {s for s, _, _ in self.subscriptions.values()}
+                for station in stations_to_check:
+                    trains = await self.fetch_trains(station)
+                    for time_t, (sub_station, last_status, last_plat) in list(self.subscriptions.items()):
+                        if sub_station != station: continue
+                        match = next((t for t in trains if t['std'] == time_t), None)
                         if match:
-                            current_status = match['etd']
-                            
-                            # 1. Check for status changes (e.g., 'On time' -> '17:46')
-                            if current_status != last_status:
-                                self.subscriptions[time_target] = current_status
-                                alert = f"⚠️ **TRAIN UPDATE**: The **{time_target}** to **{match['dest']}** is now: **{current_status}**"
-                                await alert_callback(alert)
-
-                            # 2. Auto-unwatch if it has departed
-                            if "Departed" in current_status:
-                                to_remove.append(time_target)
-                                logging.info(f"Auto-unwatching {time_target} (Departed)")
-                        
-                        else:
-                            # 3. Auto-unwatch if the train is no longer on the board
-                            to_remove.append(time_target)
-                            logging.info(f"Auto-unwatching {time_target} (No longer on board)")
-
-                # Clean up the subscriptions
-                for time_target in to_remove:
-                    if time_target in self.subscriptions:
-                        del self.subscriptions[time_target]
-
-            except Exception as e:
-                logging.error(f"Error in monitor_subscriptions: {e}")
-                
+                            cur_status, cur_plat = match['etd'], match['plat']
+                            if cur_status != last_status or cur_plat != last_plat:
+                                self.subscriptions[time_t] = (station, cur_status, cur_plat)
+                                await alert_callback(f"⚠️ **UPDATE**: {time_t} from **{station}** is **{cur_status}** [P{cur_plat}]")
+                            if "Departed" in cur_status: to_remove.append(time_t)
+                        else: to_remove.append(time_t)
+                for t in to_remove: self.subscriptions.pop(t, None)
+            except Exception as e: logging.error(f"Monitor: {e}")
             await asyncio.sleep(120)
 
     async def handle_command(self, text):
@@ -119,29 +103,47 @@ class TrainBot:
 
         if cmd in ["/usage", "/help"]:
             return (
-                "🚆 *Train Bot Usage*\n"
-                "• `/trains [CRS]` - List next 10 departures (default: NEM)\n"
-                "• `/watch [time]` - Alert if status changes. Ex: `/watch 08:15`\n"
-                "• `/unwatch` - Clear current subscriptions\n"
-                "• `/usage` - Show this menu"
+                "🚆 **Train Bot**\n"
+                "• `/trains [from] [to]` - Board (shortcuts ok)\n"
+                "• `/watch [time]` - Watch last queried station\n"
+                "• `/unwatch` - Clear alerts\n"
+                "• `/list` - Show shortcuts\n"
+                "• `/add [name] [CRS]` - Add shortcut"
             )
 
         if cmd == "/trains":
-            crs = parts[1].upper() if len(parts) > 1 else 'NEM'
-            trains = await self.fetch_trains(crs)
-            if not trains: return f"⚠️ No trains found for {crs}."
-            msg = f"🚆 Departures for {crs}:\n"
+            origin = self.default_crs
+            dest = None
+            if len(parts) == 2:
+                origin = self.stations.get(parts[1].lower(), parts[1].upper())
+            elif len(parts) >= 3:
+                origin = self.stations.get(parts[1].lower(), parts[1].upper())
+                dest = self.stations.get(parts[2].lower(), parts[2].upper())
+
+            self.current_context_crs = origin # 'Sticky' for subsequent /watch
+            trains = await self.fetch_trains(origin, dest)
+            if not trains: return f"⚠️ No trains for {origin}" + (f" to {dest}" if dest else ".")
+            
+            msg = f"🚆 **{origin} Departures**" + (f" to **{dest}**" if dest else "") + ":\n"
             for t in trains:
-                msg += f"• {t['std']} to {t['dest']}: {t['etd']}\n"
+                msg += f"• {t['std']} to {t['dest']}: **{t['etd']}** [P{t['plat']}]\n"
             return msg
 
         if cmd == "/watch" and len(parts) > 1:
             time_target = parts[1]
-            self.subscriptions[time_target] = "Unknown"
-            return f"🔔 Watching the {time_target} departure from {self.crs} for updates."
+            # Uses the origin station from the last successful /trains call
+            self.subscriptions[time_target] = (self.current_context_crs, "Unknown", "TBC")
+            return f"🔔 Watching the **{time_target}** from **{self.current_context_crs}**."
 
         if cmd == "/unwatch":
             self.subscriptions.clear()
-            return "🔕 Subscriptions cleared."
+            return "🔕 All watches cleared."
 
-        return None
+        if cmd == "/list":
+            return "📋 **Saved Stations:**\n" + "\n".join([f"• {k.title()}: {v}" for k,v in self.stations.items()])
+
+        if cmd == "/add" and len(parts) >= 3:
+            name, crs = parts[1].lower(), parts[2].upper()
+            self.stations[name] = crs
+            self.save_stations()
+            return f"✅ Added shortcut: **{name}** → **{crs}**"
