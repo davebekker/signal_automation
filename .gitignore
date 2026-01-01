@@ -6,6 +6,7 @@ kingston.py
 # Local Data and State
 budget_state.json
 bins.json
+stations.json
 
 # Python Environment
 __pycache__/

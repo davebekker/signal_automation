@@ -1,0 +1,11 @@
+# Asynchronous HTTP for Signal API and National Rail
+aiohttp==3.9.1
+
+# HTML Scraping for BinBot (Kingston Council)
+beautifulsoup4==4.12.2
+
+# Environment variable management (.env)
+python-dotenv==1.0.0
+
+# XML Parsing (Standard library, but listed for documentation)
+# xml.etree.ElementTree
