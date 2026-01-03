@@ -7,6 +7,7 @@ kingston.py
 budget_state.json
 bins.json
 stations.json
+*.json
 
 # Python Environment
 __pycache__/
@@ -17,6 +18,7 @@ venv/
 env/
 build/
 dist/
+downloads/
 *.egg-info/
 
 # System files

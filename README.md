@@ -27,6 +27,7 @@ A multi-purpose, event-driven home assistant bot for Signal. This suite provides
 
 | Command | Description |
 | :--- | :--- |
+| `/usage` | List commands available in the bot |
 | `/trains [from] [to]` | Show departures. Supports shortcuts or CRS codes. |
 | `/watch [time]` | Monitor a specific train for status/platform changes. |
 | `/add [name] [CRS]` | Save a station shortcut (e.g., `/add work WAT`). |
@@ -34,7 +35,8 @@ A multi-purpose, event-driven home assistant bot for Signal. This suite provides
 | `/unwatch` | Clear active train subscriptions. |
 | `/bins` | Show the next 4 weeks of bin collections. |
 | `/budget` | Show current balance and last 5 transactions. |
-| `[amount] [desc]` | Add a manual transaction (e.g., `5.50 lunch`). |
+| `/add [amount] [desc]` | Add a manual transaction (e.g., `5.50 lunch`). |
+| `/sub [amount] [desc]` | Add a manual transaction (e.g., `5.50 lunch`). |
 
 ---
 
