@@ -12,7 +12,7 @@ load_dotenv()
 class NestBot:
     def __init__(self):
         self.sync_interval = 30  # Default minutes
-        self.messaging_enabled = True
+        self.messaging_enabled = False
         self.state_file = "nest_state.json"
         
         # Initialize Google Connection
@@ -26,6 +26,7 @@ class NestBot:
         self.download_path = os.getenv("DOWNLOAD_PATH", "./downloads")
         self.max_folder_gb = 10  # Max storage limit
         self.max_age_days = 30   # Delete older than a mont
+        self.recent_events = [] # Store as (timestamp, camera, filepath)
 
     def load_state(self):
         if os.path.exists(self.state_file):
@@ -73,6 +74,7 @@ class NestBot:
                 return f"⏳ Nest Sync interval updated to **{self.sync_interval} minutes**."
             except ValueError:
                 return "❌ Please provide a valid number of minutes."
+            return f'Nest Sync interval is currently set to **{self.sync_interval} minutes**'
 
         elif cmd == "/message":
             if len(parts) > 1:
@@ -89,7 +91,29 @@ class NestBot:
                 "🚆 **Nest Bot**\n"
                 "• `/sync [minutes]` - Set camera download interval\n"
                 "• `/message [on/off]` - receive video alerts\n"
+                "• `/events` - Show last 10 events\n"
+                "• `/get [event]` - Get full video for event\n"
             )
+        elif cmd == "/events":
+            if not self.recent_events:
+                return "📭 No recent events recorded."
+            
+            msg = "📹 **Recent Nest Events:**\n"
+            # Show last 10 events
+            for i, (ts, cam, _) in enumerate(self.recent_events[-10:]):
+                msg += f"{i+1}. [{cam}] {ts.strftime('%H:%M:%S')}\n"
+            msg += "\nUse `/get [number]` for full clip."
+            return msg
+        elif cmd == "/get" and len(parts) > 1:
+            try:
+                idx = int(parts[1]) - 1
+                # Need to handle the slice offset if only showing last 10
+                target = self.recent_events[-10:][idx]
+                # Return a special tuple to tell master_bot to send a file
+                return ("FILE", f"Sending full clip for {target[1]}...", target[2])
+            except (ValueError, IndexError):
+                return "❌ Invalid event number."
+
 
     async def sync_task(self, alert_callback):
         """Modified sync loop to use the dynamic interval and callback."""
@@ -124,9 +148,10 @@ class NestBot:
                             if video_bytes:
                                 with open(filepath, "wb") as f:
                                     f.write(video_bytes)
-                                
-                                # 2. Filter Alerts by Camera Name
-                                if device.device_name in self.monitored:
+                                self.recent_events.append((event.start_time, device.device_name, filepath))
+                                if len(self.recent_events) > 50: self.recent_events.pop(0)
+                                # 2. Filter Alerts by Camera Name and whether messaging is enabled
+                                if device.device_name in self.monitored and self.messaging_enabled:
                                     await alert_callback(f"Alert: {device.device_name} - {event.start_time.strftime('%d-%m-%Y_%H:%M:%S')}", filepath)
 
                         if not latest_event_time or event.start_time > latest_event_time:

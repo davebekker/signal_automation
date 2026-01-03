@@ -104,7 +104,11 @@ async def master_listener(budget_bot, train_bot, bin_bot, nest_bot):
                                 elif internal_id == os.getenv("NEST_INTERNAL_ID"):
                                     reply = await nest_bot.handle_command(incoming_text)
                                     if reply:
-                                        await send_signal(session, reply, BOT_ROUTING[internal_id])
+                                        if isinstance(reply, tuple) and reply[0] == "FILE":
+                                            # reply = ("FILE", "Message text", "filepath")
+                                            await send_signal(session, reply[1], BOT_ROUTING[internal_id], reply[2])
+                                        else:
+                                            await send_signal(session, reply, BOT_ROUTING[internal_id])
                                 
                                 else:
                                     logging.info(f"Ignored command from unknown source: {internal_id}")
