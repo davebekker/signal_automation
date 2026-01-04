@@ -68,12 +68,13 @@ class NestBot:
         parts = text.split()
         cmd = parts[0].lower()
 
-        if cmd == "/sync" and len(parts) > 1:
-            try:
-                self.sync_interval = int(parts[1])
-                return f"⏳ Nest Sync interval updated to **{self.sync_interval} minutes**."
-            except ValueError:
-                return "❌ Please provide a valid number of minutes."
+        if cmd == "/sync":
+            if len(parts) > 1:
+                try:
+                    self.sync_interval = int(parts[1])
+                    return f"⏳ Nest Sync interval updated to **{self.sync_interval} minutes**."
+                except ValueError:
+                    return "❌ Please provide a valid number of minutes."
             return f'Nest Sync interval is currently set to **{self.sync_interval} minutes**'
 
         elif cmd == "/message":

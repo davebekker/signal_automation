@@ -12,6 +12,7 @@ from budget_bot import BudgetBot
 from train_bot import TrainBot
 from bin_bot import BinBot
 from nest_bot import NestBot
+from bots.reminder_bot import ReminderBot
 
 load_dotenv()
 
@@ -27,7 +28,8 @@ BOT_ROUTING = {
     os.getenv("TRAIN_INTERNAL_ID"): os.getenv("TRAIN_RECIPIENT"),
     os.getenv("BIN_INTERNAL_ID"): os.getenv("BIN_RECIPIENT"),
     os.getenv("TESTING_INTERNAL_ID"): os.getenv("TESTING_RECIPIENT"),
-    os.getenv("NEST_INTERNAL_ID"): os.getenv("NEST_RECIPIENT")
+    os.getenv("NEST_INTERNAL_ID"): os.getenv("NEST_RECIPIENT"),
+    os.getenv("REMINDER_INTERNAL_ID"): os.getenv("REMINDER_RECIPIENT")
 }
 
 logging.basicConfig(level=logging.INFO)
@@ -54,7 +56,7 @@ async def send_signal(session, message, external_id, filepath=None):
     except Exception as e:
         logging.error(f"Send error: {e}")
 
-async def master_listener(budget_bot, train_bot, bin_bot, nest_bot):
+async def master_listener(budget_bot, train_bot, bin_bot, nest_bot, reminder_bot):
     """The single loop that polls for all messages."""
     async with aiohttp.ClientSession() as session:
         logging.info("Master Listener online. Routing messages...")
@@ -109,6 +111,10 @@ async def master_listener(budget_bot, train_bot, bin_bot, nest_bot):
                                             await send_signal(session, reply[1], BOT_ROUTING[internal_id], reply[2])
                                         else:
                                             await send_signal(session, reply, BOT_ROUTING[internal_id])
+                                elif internal_id == os.getenv("REMINDER_INTERNAL_ID"):
+                                    reply = await reminder_bot.handle_command(incoming_text)
+                                    if reply:
+                                        await send_signal(session, reply, BOT_ROUTING[internal_id])
                                 
                                 else:
                                     logging.info(f"Ignored command from unknown source: {internal_id}")
@@ -129,6 +135,7 @@ async def main():
     train_bot = TrainBot()
     bin_bot = BinBot()
     nest_bot = NestBot()
+    reminder_bot = ReminderBot()
 
     async with aiohttp.ClientSession() as session:
         # Define a small helper to bridge the TrainBot alert to the MasterBot sender
@@ -145,12 +152,16 @@ async def main():
         async def nest_alert_handler(message, filepath=None):
             await send_signal(session, message, os.getenv("NEST_RECIPIENT"), filepath)
 
+        async def remind_alert_handler(message):
+            await send_signal(session, message, os.getenv("REMINDER_RECIPIENT"))
+
         await asyncio.gather(
-            master_listener(budget_bot, train_bot, bin_bot, nest_bot),
+            master_listener(budget_bot, train_bot, bin_bot, nest_bot, reminder_bot),
             nest_bot.sync_task(nest_alert_handler),
             budget_bot.weekly_task(budget_alert_handler),
             train_bot.monitor_subscriptions(train_alert_handler),
-            bin_bot.bin_scheduler(bin_alert_handler)
+            bin_bot.bin_scheduler(bin_alert_handler),
+            reminder_bot.check_reminders(remind_alert_handler)
         )
 
 if __name__ == "__main__":
