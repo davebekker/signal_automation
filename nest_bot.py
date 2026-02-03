@@ -124,17 +124,23 @@ class NestBot:
                 for device in self.devices:
                     d_id = getattr(device, 'device_id', device.device_name)
                     last_ts_str = self.state.get(d_id)
+                    
                     if last_ts_str:
                         last_ts = dt.datetime.fromisoformat(last_ts_str)
-                        # Calculate minutes since last successful sync
-                        delta = int((now - last_ts).total_seconds() / 60) + 2 
+                        # Calculate minutes since last sync
+                        diff_minutes = int((now - last_ts).total_seconds() / 60) + 2 
+                        # 🛡️ SAFETY CAP: Limit lookback to 180m to prevent 400 Errors
+                        delta = min(diff_minutes, 180)
                     else:
-                        delta = 180 # Default fallback
+                        delta = 180 # Default fallback for new devices
+                        last_ts = now - dt.timedelta(minutes=180)
 
                     logger.info(f"Syncing {device.device_name} (Lookback: {delta}m)")
+                    
+                    # Fetch events with the capped duration
                     events = device.get_events(end_time=now, duration_minutes=delta)
                     
-                    latest_event_time = last_ts if last_ts_str else None
+                    latest_event_time = last_ts
 
                     for event in (events or []):
                         # Avoid duplicates
