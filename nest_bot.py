@@ -27,6 +27,8 @@ class NestBot:
         self.max_folder_gb = 10  # Max storage limit
         self.max_age_days = 30   # Delete older than a mont
         self.recent_events = [] # Store as (timestamp, camera, filepath)
+        # allow command to automatically trigger a sync
+        self.manual_sync_trigger = asyncio.Event()
 
     def load_state(self):
         if os.path.exists(self.state_file):
@@ -70,6 +72,9 @@ class NestBot:
 
         if cmd == "/sync":
             if len(parts) > 1:
+                if parts[1].lower() == "now": # Check for 'now'
+                    self.manual_sync_trigger.set() # Trigger the sync
+                    return "🔄 Manual Nest sync triggered! Checking cameras now..."
                 try:
                     self.sync_interval = int(parts[1])
                     return f"⏳ Nest Sync interval updated to **{self.sync_interval} minutes**."
@@ -164,6 +169,8 @@ class NestBot:
                         if not latest_event_time or event.start_time > latest_event_time:
                             latest_event_time = event.start_time
 
+                    if events:
+                        self.cleanup_storage()
                     # 3. Update State
                     if latest_event_time:
                         self.state[d_id] = latest_event_time.isoformat()
@@ -173,4 +180,16 @@ class NestBot:
             except Exception as e:
                 logger.error(f"Nest Sync Error: {e}")
             
-            await asyncio.sleep(self.sync_interval * 60)
+            # Wait for either the interval to pass OR the manual trigger event
+            try:
+                # Wait for the event to be set, with a timeout equal to your sync interval
+                await asyncio.wait_for(
+                    self.manual_sync_trigger.wait(), 
+                    timeout=self.sync_interval * 60
+                )
+            except asyncio.TimeoutError:
+                # This is the normal flow when the timer expires
+                pass
+            finally:
+                # Clear the trigger so it doesn't loop infinitely
+                self.manual_sync_trigger.clear()

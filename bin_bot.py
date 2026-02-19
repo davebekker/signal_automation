@@ -55,17 +55,23 @@ class BinBot:
                                 bin_name = service.get_text(strip=True)
                                 if "Bulky" in bin_name: continue
 
-                                # Navigate GDS Summary List structure
-                                parent_row = service.find_next('div', class_='govuk-grid-row')
-                                if parent_row:
-                                    next_col_dt = parent_row.find('dt', string=lambda t: t and "Next collection" in t)
-                                    if next_col_dt:
-                                        date_dd = next_col_dt.find_next_sibling('dd')
-                                        if date_dd:
-                                            clean_date = date_dd.get_text(" ", strip=True).split('(')[0].strip()
-                                            print(f"• {bin_name.ljust(22)} : {clean_date}")
-                                            clean_date = date_dd.get_text(" ", strip=True).split('(')[0].strip()
-                                            collections.append({"type": bin_name, "date": clean_date})
+                                # 1. Find the summary list associated with this service
+                                # Kingston usually puts the data in a <dl> (description list) after the h3
+                                summary_list = service.find_next('dl', class_='govuk-summary-list')
+                                
+                                if summary_list:
+                                    # 2. Find the row where the key (dt) is "Next collection"
+                                    rows = summary_list.find_all('div', class_='govuk-summary-list__row')
+                                    for row in rows:
+                                        key = row.find('dt', class_='govuk-summary-list__key')
+                                        if key and "Next collection" in key.get_text():
+                                            value = row.find('dd', class_='govuk-summary-list__value')
+                                            if value:
+                                                # Strip the ordinal suffixes (st, nd, rd, th) and brackets
+                                                raw_date = value.get_text(" ", strip=True).split('(')[0].strip()
+                                                collections.append({"type": bin_name, "date": raw_date})
+                                                print(f"• {bin_name.ljust(22)} : {raw_date}")
+                                                break
                             if collections:
                                 logging.info(f"✅ BinBot data retrieved successfully on attempt {attempt + 1}")
                                 return collections
@@ -123,13 +129,26 @@ class BinBot:
                 parsed_dates = []
                 for c in data:
                     clean_date = self.clean_kingston_date(c['date'])
-                    # Format is now: 'Saturday 3 January 2026'
+                    # Format: 'Thursday 15 January 2026'
                     dt = datetime.strptime(f"{clean_date} {now.year}", "%A %d %B %Y")
                     
-                    # Handle year wrap-around
-                    if dt < now - timedelta(days=2): 
+                    # --- FIXED YEAR WRAP LOGIC ---
+                    # If the date is more than 6 months in the past, it's almost certainly for NEXT year.
+                    # (e.g. It's December and the JSON says "January")
+                    if dt < now - timedelta(days=180):
                         dt = dt.replace(year=now.year + 1)
+                        
+                    # If the date is in the past but LESS than 6 months ago, it's just "stale" data.
+                    # We should keep the current year but it will be filtered out by 'dt > now' later.
+                    
                     parsed_dates.append((dt, c['type']))
+
+                # Filter for only future events so we don't sleep until a date in the past
+                future_dates = [d for d in parsed_dates if d[0] > now]
+
+                if not future_dates:
+                    logger.warning("No future bin collections found in data. JSON might be stale.")
+                    return 3600 # Check again in 1 hour
                 
                 # Sort to find the nearest collection day
                 parsed_dates.sort(key=lambda x: x[0])
