@@ -1,11 +1,35 @@
-# Asynchronous HTTP for Signal API and National Rail
-aiohttp==3.9.1
+# Signal Automation Bot dependencies
+# Python 3.12+ recommended. Standard-library modules such as sqlite3,
+# xml.etree.ElementTree, json, asyncio, pathlib, and mimetypes are not listed.
 
-# HTML Scraping for BinBot (Kingston Council)
-beautifulsoup4==4.12.2
+# Core async HTTP / WebSocket support for Signal API, TrainBot and BinBot
+aiohttp>=3.9,<4
+httpx>=0.27,<1
 
-# Environment variable management (.env)
-python-dotenv==1.0.0
+# Environment variable management for legacy/env-based config
+python-dotenv>=1.0,<2
 
-# XML Parsing (Standard library, but listed for documentation)
-# xml.etree.ElementTree
+# HTML scraping for BinBot
+beautifulsoup4>=4.12,<5
+
+# ReminderBot natural-language date parsing
+dateparser>=1.2,<2
+python-dateutil>=2.8,<3
+
+# Optional LLM parsing for ReminderBot and image alt-text support in BlueskyBot
+# Provides: from google import genai
+google-genai>=1.0,<2
+
+# Bluesky posting / replies / image handling
+atproto>=0.0.55
+Pillow>=10,<12
+
+# Nest / Google Home integration utilities
+requests>=2.31,<3
+glocaltokens>=0.7
+pytz>=2024.1
+isodate>=0.6,<1
+
+# Nest data models
+# The current utils/models.py uses Pydantic v1-style validators.
+pydantic>=1.10,<2
