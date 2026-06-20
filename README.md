@@ -1,5 +1,7 @@
 # Signal Automation Bot
 
+> Replace placeholders such as `<user>`, `<uid>`, `<google-workspace-or-domain>`, `<google-user>`, and `<camera-archive-folder>` with values from the target machine. Do not commit real API keys, Signal state, or private config files to a public repository.
+
 A personal Signal-based automation hub that routes slash commands from Signal to a set of small Python bots. The project currently runs on an Ubuntu desktop, with the Signal API served by the `bbernhard/signal-cli-rest-api` Docker image and the Python master bot managed by a `systemd --user` service.
 
 The design goal is pragmatic reliability: keep the home network infrastructure separate from the bot stack, run the bot automatically after reboot, and keep enough config/state backed up to recover quickly after SSD failure or reinstall.
@@ -199,9 +201,9 @@ Example for the current desktop setup:
   "state_file": "nest_state.json",
   "download_path": "/dev/shm/nest_events",
   "pending_archive_dir": "data/nest_pending_archive",
-  "drive_base": "/run/user/1000/gvfs/google-drive:host=thebekkers.com,user=dave",
-  "drive_archive_path": "/run/user/1000/gvfs/google-drive:host=thebekkers.com,user=dave/My Drive/Camera_archive",
-  "mount_drive": "google-drive://thebekkers.com/dave",
+  "drive_base": "/run/user/<uid>/gvfs/google-drive:host=<google-workspace-or-domain>,user=<google-user>",
+  "drive_archive_path": "/run/user/<uid>/gvfs/google-drive:host=<google-workspace-or-domain>,user=<google-user>/My Drive/<camera-archive-folder>",
+  "mount_drive": "google-drive://<google-workspace-or-domain>/<google-user>",
   "monitored_cameras": ["Backyard", "Nest Doorbell (battery)"],
   "ignored_cameras": ["Rookery"],
   "lookback_cap_minutes": 150,
@@ -303,7 +305,7 @@ utils/tools.py
 Current expected working directory:
 
 ```text
-/home/dave-bekker/Projects/signal_automation
+/home/<user>/Projects/signal_automation
 ```
 
 Suggested layout:
@@ -338,7 +340,7 @@ signal_automation/
 Signal API state lives outside the project folder:
 
 ```text
-/home/dave-bekker/google_home/google-nest-telegram-sync/signal-data
+/home/<user>/signal-data
 ```
 
 This is critical state. Back it up.
@@ -375,20 +377,20 @@ If this only works with `sudo`, fix Docker permissions or use system-level servi
 Expected location:
 
 ```bash
-mkdir -p /home/dave-bekker/Projects
-cd /home/dave-bekker/Projects
+mkdir -p /home/<user>/Projects
+cd /home/<user>/Projects
 ```
 
 Restore the project into:
 
 ```text
-/home/dave-bekker/Projects/signal_automation
+/home/<user>/Projects/signal_automation
 ```
 
 Create virtual environment:
 
 ```bash
-cd /home/dave-bekker/Projects/signal_automation
+cd /home/<user>/Projects/signal_automation
 python3 -m venv .venv
 source .venv/bin/activate
 pip install --upgrade pip
@@ -434,7 +436,7 @@ SQLite WAL files matter if present:
 Restore Signal data:
 
 ```text
-/home/dave-bekker/google_home/google-nest-telegram-sync/signal-data
+/home/<user>/signal-data
 ```
 
 ---
@@ -450,7 +452,7 @@ Start/recreate container:
 
 /snap/bin/docker run -d --name signal-api --restart=unless-stopped \
   -p 8080:8080 \
-  -v /home/dave-bekker/google_home/google-nest-telegram-sync/signal-data:/home/.local/share/signal-cli \
+  -v /home/<user>/signal-data:/home/.local/share/signal-cli \
   -e MODE=json-rpc-native \
   -e JSON_RPC_TRUST_NEW_IDENTITIES=always \
   bbernhard/signal-cli-rest-api:latest
@@ -472,7 +474,7 @@ The Python master bot is managed by `systemd --user`.
 Service file:
 
 ```text
-/home/dave-bekker/.config/systemd/user/signal-master-bot.service
+/home/<user>/.config/systemd/user/signal-master-bot.service
 ```
 
 Recommended content:
@@ -483,9 +485,9 @@ Description=Signal Master Bot
 
 [Service]
 Type=simple
-WorkingDirectory=/home/dave-bekker/Projects/signal_automation
+WorkingDirectory=/home/<user>/Projects/signal_automation
 ExecStartPre=/bin/sleep 20
-ExecStart=/home/dave-bekker/Projects/signal_automation/.venv/bin/python /home/dave-bekker/Projects/signal_automation/master_bot_v2.py
+ExecStart=/home/<user>/Projects/signal_automation/.venv/bin/python /home/<user>/Projects/signal_automation/master_bot_v2.py
 Restart=on-failure
 RestartSec=10
 Environment=PYTHONUNBUFFERED=1
@@ -497,8 +499,8 @@ WantedBy=default.target
 Enable lingering so the user service starts after reboot before SSH login:
 
 ```bash
-sudo loginctl enable-linger dave-bekker
-loginctl show-user dave-bekker | grep Linger
+sudo loginctl enable-linger <user>
+loginctl show-user <user> | grep Linger
 ```
 
 Expected:
@@ -547,7 +549,7 @@ systemctl --user stop signal-master-bot.service
 The current Google Drive path is a GNOME/GVFS mount:
 
 ```text
-/run/user/1000/gvfs/google-drive:host=thebekkers.com,user=dave/My Drive/Camera_archive
+/run/user/<uid>/gvfs/google-drive:host=<google-workspace-or-domain>,user=<google-user>/My Drive/<camera-archive-folder>
 ```
 
 This path usually exists only after the desktop GUI session has logged in and Drive has mounted.
@@ -567,7 +569,7 @@ After login:
 Useful checks:
 
 ```bash
-ls -ld "/run/user/1000/gvfs/google-drive:host=thebekkers.com,user=dave/My Drive/Camera_archive"
+ls -ld "/run/user/<uid>/gvfs/google-drive:host=<google-workspace-or-domain>,user=<google-user>/My Drive/<camera-archive-folder>"
 journalctl --user -u signal-master-bot.service -b --no-pager | grep -i "nest\|drive\|archive\|pending"
 ```
 
@@ -585,7 +587,7 @@ Signal commands:
 Google Drive backup folder:
 
 ```text
-/run/user/1000/gvfs/google-drive:host=thebekkers.com,user=dave/My Drive/signal_automation
+/run/user/<uid>/gvfs/google-drive:host=<google-workspace-or-domain>,user=<google-user>/My Drive/signal_automation
 ```
 
 Recommended backup layout:
@@ -692,9 +694,9 @@ Recommended manual update process:
 
 ```bash
 # 1. Back up Signal state
-mkdir -p /home/dave-bekker/backups/signal_api
-rsync -a /home/dave-bekker/google_home/google-nest-telegram-sync/signal-data/ \
-  /home/dave-bekker/backups/signal_api/signal-data-$(date +%Y%m%d_%H%M%S)/
+mkdir -p /home/<user>/backups/signal_api
+rsync -a /home/<user>/signal-data/ \
+  /home/<user>/backups/signal_api/signal-data-$(date +%Y%m%d_%H%M%S)/
 
 # 2. Pull latest image
 /snap/bin/docker pull bbernhard/signal-cli-rest-api:latest
@@ -704,7 +706,7 @@ rsync -a /home/dave-bekker/google_home/google-nest-telegram-sync/signal-data/ \
 
 /snap/bin/docker run -d --name signal-api --restart=unless-stopped \
   -p 8080:8080 \
-  -v /home/dave-bekker/google_home/google-nest-telegram-sync/signal-data:/home/.local/share/signal-cli \
+  -v /home/<user>/signal-data:/home/.local/share/signal-cli \
   -e MODE=json-rpc-native \
   -e JSON_RPC_TRUST_NEW_IDENTITIES=always \
   bbernhard/signal-cli-rest-api:latest
@@ -768,13 +770,13 @@ journalctl --user -u signal-master-bot.service -b --no-pager | grep -i "error\|w
 3. Restore project folder to:
 
    ```text
-   /home/dave-bekker/Projects/signal_automation
+   /home/<user>/Projects/signal_automation
    ```
 
 4. Restore Signal data to:
 
    ```text
-   /home/dave-bekker/google_home/google-nest-telegram-sync/signal-data
+   /home/<user>/signal-data
    ```
 
 5. Recreate Python virtual environment.
@@ -802,7 +804,7 @@ journalctl --user -u signal-master-bot.service -b --no-pager | grep -i "error\|w
 
 ## Current design choices
 
-- Run the bot on the desktop, not the NanoPi, to avoid increasing the blast radius of DNS/VPN infrastructure.
+- Run the bot on a non-critical host where possible, rather than on DNS/VPN/router infrastructure, to reduce blast radius.
 - Use Docker restart policy for Signal API.
 - Use `systemd --user` for the Python master bot.
 - Keep Google Drive as backup/recovery storage, not the live working directory.
