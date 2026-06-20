@@ -23,3 +23,19 @@ downloads/
 
 # System files
 .DS_Store
+bridge.db
+bridge.db-shm
+bridge.db-wal
+.gitignore
+restart_docker.txt
+restart
+signal_automation_ubuntu_runbook.md
+.gitignore
+signal_automation.zip
+signal-cli-update.sh
+bots/reminder_bot_v2.py.backup
+bots/reminder_bot.py.backup
+*.backup
+*.sqlite
+*.sqlite-*
+*.mp4

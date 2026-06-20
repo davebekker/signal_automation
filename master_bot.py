@@ -6,6 +6,7 @@ import json
 from dotenv import load_dotenv
 import httpx
 import base64
+from pathlib import Path
 
 # Import existing bot logic
 from budget_bot import BudgetBot
@@ -13,6 +14,7 @@ from train_bot import TrainBot
 from bin_bot import BinBot
 from nest_bot import NestBot
 from bots.reminder_bot import ReminderBot
+from bots.bluesky_bot import BlueskyBot
 
 load_dotenv()
 
@@ -29,10 +31,34 @@ BOT_ROUTING = {
     os.getenv("BIN_INTERNAL_ID"): os.getenv("BIN_RECIPIENT"),
     os.getenv("TESTING_INTERNAL_ID"): os.getenv("TESTING_RECIPIENT"),
     os.getenv("NEST_INTERNAL_ID"): os.getenv("NEST_RECIPIENT"),
-    os.getenv("REMINDER_INTERNAL_ID"): os.getenv("REMINDER_RECIPIENT")
+    os.getenv("REMINDER_INTERNAL_ID"): os.getenv("REMINDER_RECIPIENT"),
+    os.getenv("BLUESKY_INTERNAL_ID"): os.getenv("BLUESKY_RECIPIENT"),
 }
 
+ATTACHMENTS_DIR = Path("/tmp/signal_attachments")
+ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
+
 logging.basicConfig(level=logging.INFO)
+
+
+async def download_signal_attachment(session, attachment_id, filename=None):
+    url = f"{SIGNAL_API_BASE}/v1/attachments/{attachment_id}"
+
+    async with session.get(url) as resp:
+        if resp.status != 200:
+            logging.error("Failed to download attachment %s: %s", attachment_id, resp.status)
+            return None
+
+        data = await resp.read()
+
+    safe_name = filename or attachment_id
+    out_path = ATTACHMENTS_DIR / safe_name
+
+    with open(out_path, "wb") as f:
+        f.write(data)
+
+    logging.info("Saved attachment %s to %s", attachment_id, out_path)
+    return str(out_path)
 
 async def send_signal(session, message, external_id, filepath=None):
     """Centralized sending function."""
@@ -56,7 +82,7 @@ async def send_signal(session, message, external_id, filepath=None):
     except Exception as e:
         logging.error(f"Send error: {e}")
 
-async def master_listener(budget_bot, train_bot, bin_bot, nest_bot, reminder_bot):
+async def master_listener(budget_bot, train_bot, bin_bot, nest_bot, reminder_bot, bluesky_bot):
     """The single loop that polls for all messages."""
     async with aiohttp.ClientSession() as session:
         logging.info("Master Listener online. Routing messages...")
@@ -84,7 +110,7 @@ async def master_listener(budget_bot, train_bot, bin_bot, nest_bot, reminder_bot
                                 internal_id = target_msg.get("groupInfo", {}).get("groupId") or envelope.get("source")
                                 incoming_text = target_msg.get("message")
 
-                                if not incoming_text or not incoming_text.startswith("/"):
+                                if not incoming_text or (not incoming_text.startswith("/") and internal_id != os.getenv("BLUESKY_INTERNAL_ID")):
                                     continue
                                 print(f"incoming message received from {internal_id}")
                                 # --- ROUTING LOGIC ---
@@ -115,7 +141,39 @@ async def master_listener(budget_bot, train_bot, bin_bot, nest_bot, reminder_bot
                                     reply = await reminder_bot.handle_command(incoming_text)
                                     if reply:
                                         await send_signal(session, reply, BOT_ROUTING[internal_id])
-                                
+                                elif internal_id == os.getenv("BLUESKY_INTERNAL_ID"):
+                                    # 1. Look for attachments in both normal and sync messages
+                                    attachments = target_msg.get("attachments", [])
+                                    attachment_id = None
+                                    attachment_filename = None
+
+                                    if attachments:
+                                        attachment = attachments[0]
+                                        attachment_id = attachment.get("id")
+                                        attachment_filename = attachment.get("filename")
+                                    logging.info(
+                                        "Bluesky message text=%r attachments=%r attachment_id=%r filename=%r",
+                                        incoming_text,
+                                        attachments,
+                                        attachment_id,
+                                        attachment_filename,
+                                    )
+                                    if not incoming_text and not attachment_id:
+                                        continue                     
+                                    image_path = None
+                                    if attachment_id:
+                                        image_path = await download_signal_attachment(
+                                            session,
+                                            attachment_id,
+                                            attachment_filename,
+                                        )
+
+                                    clean_text = incoming_text.replace("/bs", "", 1).strip()
+                                    status = await bluesky_bot.handle_command(
+                                        text=clean_text,
+                                        image_path=image_path,
+                                    )
+                                    continue
                                 else:
                                     logging.info(f"Ignored command from unknown source: {internal_id}")
 
@@ -136,6 +194,7 @@ async def main():
     bin_bot = BinBot()
     nest_bot = NestBot()
     reminder_bot = ReminderBot()
+    bluesky_bot = BlueskyBot()
 
     async with aiohttp.ClientSession() as session:
         # Define a small helper to bridge the TrainBot alert to the MasterBot sender
@@ -156,7 +215,7 @@ async def main():
             await send_signal(session, message, os.getenv("REMINDER_RECIPIENT"))
 
         await asyncio.gather(
-            master_listener(budget_bot, train_bot, bin_bot, nest_bot, reminder_bot),
+            master_listener(budget_bot, train_bot, bin_bot, nest_bot, reminder_bot, bluesky_bot),
             nest_bot.sync_task(nest_alert_handler),
             budget_bot.weekly_task(budget_alert_handler),
             train_bot.monitor_subscriptions(train_alert_handler),
