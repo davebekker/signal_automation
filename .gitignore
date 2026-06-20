@@ -19,6 +19,7 @@ env/
 build/
 dist/
 downloads/
+history/
 *.egg-info/
 
 # System files
