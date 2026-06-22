@@ -45,6 +45,7 @@ BOT_ENV = {
     "bluesky": ("BLUESKY_INTERNAL_ID", "BLUESKY_RECIPIENT"),
 }
 
+SHOPPING_GROUP_INTERNAL_ID = os.getenv('SHOPPING_INTERNAL_ID')
 
 class ConfigError(RuntimeError):
     """Raised when required configuration is invalid or incomplete."""
@@ -832,6 +833,9 @@ async def _handle_signal_item(
     internal_id = _internal_id_for(envelope, target_msg)
     if not internal_id:
         LOGGER.debug("Ignoring Signal message without source/group id")
+        return
+    if internal_id in SHOPPING_GROUP_INTERNAL_ID:
+        LOGGER.debug("Ignoring Shopping group message in master bot")
         return
 
     route = config.route_for_internal_id(internal_id)
