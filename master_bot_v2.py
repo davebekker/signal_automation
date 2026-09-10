@@ -828,6 +828,7 @@ async def _handle_signal_item(
 ) -> None:
     envelope, target_msg = _extract_target_message(item)
     if not target_msg:
+        # LOGGER.info("Raw incoming message group/source ID: %r", internal_id)
         return
 
     internal_id = _internal_id_for(envelope, target_msg)

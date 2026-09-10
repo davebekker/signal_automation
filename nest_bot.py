@@ -13,6 +13,8 @@ from dotenv import load_dotenv
 
 from utils.google_auth_wrapper import GoogleConnection
 from utils.tools import logger
+import glob
+
 
 load_dotenv()
 
@@ -190,6 +192,29 @@ class NestBot:
     def save_state(self) -> None:
         _atomic_write_json(self.state_file, self.state)
 
+    def _get_active_drive_dir(self) -> Path | None:
+        """Finds the active GVFS Google Drive folder and cleans up stale mounts."""
+        gvfs_base = Path("/run/user/1000/gvfs")
+        if not gvfs_base.exists():
+            return None
+
+        # Glob for any google-drive folder regardless of prefix/suffix
+        candidates = glob.glob(str(gvfs_base / "google-drive*"))
+
+        for candidate in candidates:
+            try:
+                target = Path(candidate) / "My Drive" / "Camera_archive"
+                if target.is_dir():
+                    return target
+            except OSError as exc:
+                # Catch Errno 107 / broken endpoints and auto-recover
+                if getattr(exc, "errno", None) == 107 or "107" in str(exc):
+                    LOGGER.warning("Auto-clearing stale GVFS mount: %s", candidate)
+                    subprocess.run(["fusermount", "-uz", candidate], capture_output=True)
+                    subprocess.run(["systemctl", "--user", "restart", "gvfs-daemon.service"], capture_output=True)
+
+        return None
+
     def _drive_path(self) -> Optional[Path]:
         if self.drive_archive_path:
             return Path(str(self.drive_archive_path))
@@ -197,10 +222,21 @@ class NestBot:
             return Path(str(self.drive_base))
         return None
 
-    def _drive_available(self) -> bool:
-        path = self._drive_path()
-        return bool(path and path.exists() and path.is_dir())
+    # def _drive_available(self) -> bool:
+    #     path = self._drive_path()
+    #     try:
+    #         return bool(path and path.exists() and path.is_dir())
+    #     except OSError as exc:
+    #         logger.warning("Drive path unavailable/disconnected: %s", exc)
+    #         return False
 
+    def _drive_available(self) -> bool:
+        drive_path = self._get_active_drive_dir()
+        if drive_path is not None:
+            self.drive_archive_dir = drive_path  # Update internal path reference dynamically
+            return True
+        return False
+    
     async def _try_wake_drive(self) -> bool:
         if self._drive_available():
             return True
