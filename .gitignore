@@ -40,3 +40,8 @@ bots/reminder_bot.py.backup
 *.sqlite
 *.sqlite-*
 *.mp4
+
+# Local backups
+backups/
+*.bak*
+

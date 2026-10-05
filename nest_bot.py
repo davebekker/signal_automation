@@ -209,7 +209,7 @@ class NestBot:
             except OSError as exc:
                 # Catch Errno 107 / broken endpoints and auto-recover
                 if getattr(exc, "errno", None) == 107 or "107" in str(exc):
-                    LOGGER.warning("Auto-clearing stale GVFS mount: %s", candidate)
+                    logger.warning("Auto-clearing stale GVFS mount: %s", candidate)
                     subprocess.run(["fusermount", "-uz", candidate], capture_output=True)
                     subprocess.run(["systemctl", "--user", "restart", "gvfs-daemon.service"], capture_output=True)
 
@@ -222,18 +222,16 @@ class NestBot:
             return Path(str(self.drive_base))
         return None
 
-    # def _drive_available(self) -> bool:
-    #     path = self._drive_path()
-    #     try:
-    #         return bool(path and path.exists() and path.is_dir())
-    #     except OSError as exc:
-    #         logger.warning("Drive path unavailable/disconnected: %s", exc)
-    #         return False
-
     def _drive_available(self) -> bool:
+        path = self._drive_path()
+        try:
+            if path and path.exists() and path.is_dir():
+                return True
+        except OSError as exc:
+            logger.warning("Configured drive path unavailable: %s", exc)
+
         drive_path = self._get_active_drive_dir()
         if drive_path is not None:
-            self.drive_archive_dir = drive_path  # Update internal path reference dynamically
             return True
         return False
     
@@ -298,7 +296,8 @@ class NestBot:
             return (0, len(pending_files))
 
         copied = 0
-        for source in pending_files[: self.pending_retry_limit]:
+        limit = self.pending_retry_limit if self.pending_retry_limit > 0 else len(pending_files)
+        for source in pending_files[:limit]:
             destination = self._archive_path_for(source.name)
             if not destination:
                 break

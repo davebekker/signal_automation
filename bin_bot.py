@@ -201,13 +201,14 @@ class BinBot:
         return night_before, morning_of, refresh_time
 
     async def _sleep_until(self, target, label):
-        now = datetime.now()
-        delay = max((target - now).total_seconds(), 0)
-        if delay <= 0:
-            return
-        sleep_for = min(delay, self.max_sleep_seconds)
-        logging.info("BinBot: Sleeping %.1fh until %s.", sleep_for / 3600, label)
-        await asyncio.sleep(sleep_for)
+        while True:
+            now = datetime.now()
+            delay = (target - now).total_seconds()
+            if delay <= 0:
+                return
+            sleep_for = min(delay, self.max_sleep_seconds)
+            logging.info("BinBot: Sleeping %.1fh until %s.", sleep_for / 3600, label)
+            await asyncio.sleep(sleep_for)
 
     async def bin_scheduler(self, alert_callback):
         """Low-wake scheduler with restart-safe reminder state.
