@@ -13,7 +13,7 @@ load_dotenv()
 
 class BinBot:
     def __init__(self):
-        self.base_url = os.getenv("WASTE_URL")
+        self.base_url = (os.getenv("WASTE_URL") or "").rstrip("/")
         self.data_url = f"{self.base_url}?page_loading=1" if self.base_url else None
         self.cache_file = os.getenv("BIN_CACHE_FILE", "bins.json")
         self.state_file = os.getenv("BIN_STATE_FILE", "bins_state.json")
@@ -34,8 +34,11 @@ class BinBot:
         # Safety cap so a bad date calculation never sleeps for weeks/months without logs.
         self.max_sleep_seconds = int(os.getenv("BIN_MAX_SLEEP_SECONDS", str(24 * 3600)))
 
+        # Allow overriding User-Agent. The Kingston council site (SocietyWorks/FixMyStreet)
+        # rejects unusual/fictitious browser strings (like Firefox 146) with HTTP 503.
+        default_ua = os.getenv("BIN_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:146.0) Gecko/20100101 Firefox/146.0",
+            "User-Agent": default_ua,
             "Accept": "text/html, */*",
             "x-requested-with": "fetch",
             "Referer": self.base_url or "",
@@ -99,14 +102,24 @@ class BinBot:
             logging.error("BinBot: WASTE_URL is not configured")
             return None
 
-        async with aiohttp.ClientSession(headers=self.headers) as session:
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        async with aiohttp.ClientSession(headers=self.headers, timeout=timeout) as session:
             try:
                 # Step 1: Establish Session (Crucial for cookies)
-                await session.get(self.base_url)
+                async with session.get(self.base_url) as init_resp:
+                    if init_resp.status != 200:
+                        logging.warning("BinBot: Base URL returned HTTP %s", init_resp.status)
 
                 for attempt in range(15):
                     logging.info(f"BinBot Fetch attempt: {attempt + 1}")
                     async with session.get(self.data_url) as resp:
+                        if resp.status != 200:
+                            logging.warning("BinBot Fetch attempt %s returned HTTP %s", attempt + 1, resp.status)
+                            if resp.status == 503:
+                                logging.warning("BinBot: Received HTTP 503 (site down for maintenance or blocked User-Agent)")
+                            await asyncio.sleep(2)
+                            continue
+
                         html = await resp.text()
                         soup = BeautifulSoup(html, "html.parser")
 
@@ -138,10 +151,32 @@ class BinBot:
                                 return collections
 
                     await asyncio.sleep(2)
+                logging.warning("BinBot: Reached maximum attempts (15) without finding bin services")
                 return None
             except Exception as e:
                 logging.error(f"BinBot Fetch Error: {e}")
                 return None
+
+    def _milestones_for(self, collection_dt):
+        night_before = (collection_dt - timedelta(days=1)).replace(
+            hour=self.night_before_hour,
+            minute=self.night_before_minute,
+            second=0,
+            microsecond=0,
+        )
+        morning_of = collection_dt.replace(
+            hour=self.morning_hour,
+            minute=self.morning_minute,
+            second=0,
+            microsecond=0,
+        )
+        refresh_time = (collection_dt + timedelta(days=1)).replace(
+            hour=self.refresh_hour,
+            minute=self.refresh_minute,
+            second=0,
+            microsecond=0,
+        )
+        return night_before, morning_of, refresh_time
 
     async def get_next_run_delay(self, collections):
         """Compatibility helper retained for older callers."""
@@ -175,30 +210,11 @@ class BinBot:
 
             parsed_dates.append((dt, c["type"]))
 
-        future_dates = [d for d in parsed_dates if d[0] > now]
+        # A collection date remains active until its post-collection refresh time.
+        # This ensures morning-of reminders and restarts on collection day itself are handled correctly.
+        future_dates = [d for d in parsed_dates if self._milestones_for(d[0])[2] > now]
         future_dates.sort(key=lambda x: x[0])
         return future_dates
-
-    def _milestones_for(self, collection_dt):
-        night_before = (collection_dt - timedelta(days=1)).replace(
-            hour=self.night_before_hour,
-            minute=self.night_before_minute,
-            second=0,
-            microsecond=0,
-        )
-        morning_of = collection_dt.replace(
-            hour=self.morning_hour,
-            minute=self.morning_minute,
-            second=0,
-            microsecond=0,
-        )
-        refresh_time = (collection_dt + timedelta(days=1)).replace(
-            hour=self.refresh_hour,
-            minute=self.refresh_minute,
-            second=0,
-            microsecond=0,
-        )
-        return night_before, morning_of, refresh_time
 
     async def _sleep_until(self, target, label):
         while True:
@@ -313,12 +329,36 @@ class BinBot:
 
     async def handle_command(self, text):
         if "/bins" in text.lower():
-            data = self.load_cache() or await self.fetch_bin_data()
+            force_refresh = any(arg in text.lower() for arg in ["refresh", "fetch", "reload", "update"])
+            data = None if force_refresh else self.load_cache()
+
+            # If cache is missing or contains only expired collections, fetch fresh data
+            if not data or not self.parse_future_dates(data):
+                logging.info("BinBot: Cache missing or expired; fetching fresh bin data...")
+                fresh_data = await self.fetch_bin_data()
+                if fresh_data:
+                    data = fresh_data
+                    self.save_cache(data)
+
             if not data:
-                return "⚠️ Council site is slow. No cached data available."
-            self.save_cache(data)
+                return "⚠️ Council site is slow or unavailable. No cached data available."
+
             msg = "🚛 **Upcoming Kingston Collections:**\n\n"
             for item in data:
                 msg += f"• **{item['type']}**: {item['date']}\n"
             return msg
         return None
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    bot = BinBot()
+    res = asyncio.run(bot.fetch_bin_data())
+    print("\nFetch result:", json.dumps(res, indent=2))
+    if res:
+        bot.save_cache(res)
+        future = bot.parse_future_dates(res)
+        print("\nActive/future collections:")
+        for dt, btype in future:
+            print(f"  {dt.date()} -> {btype}")
+
