@@ -14,7 +14,9 @@ import logging
 import mimetypes
 import os
 import re
+import signal
 import sqlite3
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,7 +47,24 @@ BOT_ENV = {
     "bluesky": ("BLUESKY_INTERNAL_ID", "BLUESKY_RECIPIENT"),
 }
 
-SHOPPING_GROUP_INTERNAL_ID = os.getenv('SHOPPING_INTERNAL_ID')
+
+def _load_shopping_internal_ids() -> set[str]:
+    raw = os.getenv("SHOPPING_INTERNAL_ID")
+    if not raw:
+        return set()
+    return {val.strip() for val in raw.split(",") if val.strip()}
+
+
+SHOPPING_GROUP_INTERNAL_IDS = _load_shopping_internal_ids()
+SHOPPING_GROUP_INTERNAL_ID = os.getenv("SHOPPING_INTERNAL_ID")  # Kept for backward compatibility
+
+
+@dataclass(frozen=True)
+class BotResponse:
+    text: str
+    filepath: Optional[str] = None
+    quote_timestamp: Optional[Any] = None
+    quote_author: Optional[Any] = None
 
 class ConfigError(RuntimeError):
     """Raised when required configuration is invalid or incomplete."""
@@ -302,7 +321,7 @@ class BridgeStore:
             self._execute("INSERT OR IGNORE INTO processed_signal_messages (dedupe_key) VALUES (?)", (dedupe_key,))
 
     def activate_watch_window(self, minutes: int) -> int:
-        now = int(asyncio.get_running_loop().time())
+        now = int(time.time())
         active_until = now + max(1, minutes) * 60
         with self.conn:
             self._execute("UPDATE bluesky_watch_state SET active_until_ts = ? WHERE id = 1", (active_until,))
@@ -317,13 +336,13 @@ class BridgeStore:
         row = cur.fetchone()
         if not row or row["active_until_ts"] is None:
             return False
-        now = int(asyncio.get_running_loop().time())
+        now = int(time.time())
         return row["active_until_ts"] > now
 
     def watch_status(self) -> Dict[str, Any]:
         cur = self._execute("SELECT active_until_ts, last_manual_check_ts FROM bluesky_watch_state WHERE id = 1")
         row = cur.fetchone()
-        now = int(asyncio.get_running_loop().time())
+        now = int(time.time())
         active_until = row["active_until_ts"] if row else None
         remaining = max(0, active_until - now) if active_until else 0
         return {
@@ -334,7 +353,7 @@ class BridgeStore:
         }
 
     def mark_manual_check(self) -> None:
-        now = int(asyncio.get_running_loop().time())
+        now = int(time.time())
         with self.conn:
             self._execute("UPDATE bluesky_watch_state SET last_manual_check_ts = ? WHERE id = 1", (now,))
 
@@ -348,6 +367,28 @@ def _safe_filename(filename: Optional[str], fallback: str) -> str:
 def _guess_mime_type(filepath: str) -> str:
     guessed, _ = mimetypes.guess_type(filepath)
     return guessed or "application/octet-stream"
+
+
+def cleanup_old_attachments(attachments_dir: Path, max_age_seconds: int = 86400) -> int:
+    """Purge temporary attachments older than max_age_seconds."""
+    if not attachments_dir.exists():
+        return 0
+    now = time.time()
+    deleted = 0
+    try:
+        for file in attachments_dir.iterdir():
+            if file.is_file():
+                try:
+                    if now - file.stat().st_mtime > max_age_seconds:
+                        file.unlink(missing_ok=True)
+                        deleted += 1
+                except OSError:
+                    pass
+    except OSError as exc:
+        LOGGER.warning("Error scanning attachments directory %s: %s", attachments_dir, exc)
+    if deleted:
+        LOGGER.info("Cleaned up %d expired attachment(s) from %s", deleted, attachments_dir)
+    return deleted
 
 
 async def download_signal_attachment(
@@ -367,24 +408,35 @@ async def download_signal_attachment(
                 body = await resp.text()
                 LOGGER.error("Failed to download attachment %s: HTTP %s %s", attachment_id, resp.status, body[:300])
                 return None
-            data = await resp.read()
+
+            content_length = resp.headers.get("Content-Length")
+            if content_length and int(content_length) > config.max_attachment_bytes:
+                LOGGER.error(
+                    "Rejecting attachment %s because Content-Length is %s bytes; limit is %s bytes",
+                    attachment_id,
+                    content_length,
+                    config.max_attachment_bytes,
+                )
+                return None
+
+            data = bytearray()
+            async for chunk in resp.content.iter_chunked(64 * 1024):
+                data.extend(chunk)
+                if len(data) > config.max_attachment_bytes:
+                    LOGGER.error(
+                        "Rejecting attachment %s because it exceeded limit of %s bytes while downloading",
+                        attachment_id,
+                        config.max_attachment_bytes,
+                    )
+                    return None
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
         LOGGER.error("Failed to download attachment %s: %s", attachment_id, exc)
-        return None
-
-    if len(data) > config.max_attachment_bytes:
-        LOGGER.error(
-            "Rejecting attachment %s because it is %s bytes; limit is %s bytes",
-            attachment_id,
-            len(data),
-            config.max_attachment_bytes,
-        )
         return None
 
     safe_name = _safe_filename(filename, attachment_id)
     unique_name = f"{uuid.uuid4().hex}_{safe_name}"
     out_path = config.attachments_dir / unique_name
-    out_path.write_bytes(data)
+    await asyncio.to_thread(out_path.write_bytes, data)
     LOGGER.info("Saved attachment %s to %s", attachment_id, out_path)
     return str(out_path)
 
@@ -428,7 +480,8 @@ async def send_signal(
             elif path.stat().st_size > config.max_attachment_bytes:
                 LOGGER.error("Attachment %s exceeds limit of %s bytes", filepath, config.max_attachment_bytes)
             else:
-                b64 = base64.b64encode(path.read_bytes()).decode("utf-8")
+                raw_bytes = await asyncio.to_thread(path.read_bytes)
+                b64 = base64.b64encode(raw_bytes).decode("utf-8")
                 mime_type = _guess_mime_type(str(path))
                 filename = _safe_filename(path.name, "attachment")
                 payload["base64_attachments"].append(f"data:{mime_type};filename={filename};base64,{b64}")
@@ -563,9 +616,17 @@ async def _poll_and_mirror_bluesky_replies(
                 config=config,
             )
 
+        if not sent_ts:
+            LOGGER.error(
+                "Failed to send mirrored reply for notification %s to Signal; skipping mapping and seen mark so it can retry",
+                uri,
+            )
+            skipped += 1
+            continue
+
         store.save_mapping(
             signal_group_id=bluesky_route.internal_id if bluesky_route else None,
-            signal_ts=str(sent_ts or uri),
+            signal_ts=str(sent_ts),
             signal_sender=author,
             bluesky_uri=parsed.get("uri"),
             bluesky_cid=parsed.get("cid"),
@@ -622,7 +683,10 @@ async def _handle_bluesky_notif_command(
             except ValueError:
                 pass
         store.activate_watch_window(minutes)
-        await send_signal(session, f"🦋 Notification watch turned on for {minutes} minute(s).", route.recipient, config=config)
+        reply = f"🦋 Notification watch turned on for {minutes} minute(s)."
+        if not config.bluesky_auto_sync_enabled:
+            reply += " (Note: background sync is disabled via BLUESKY_AUTO_SYNC_ENABLED=False; use '/notif check' to poll manually)."
+        await send_signal(session, reply, route.recipient, config=config)
         return
 
     help_text = (
@@ -670,11 +734,16 @@ async def _handle_bluesky_message(
     if not incoming_text and not attachment_id:
         return
 
+    clean_text = incoming_text.replace("/bs", "", 1).strip() if incoming_text else ""
+    signal_ts = str(envelope.get("timestamp") or target_msg.get("timestamp") or "")
+    dedupe_key = f"{route.internal_id}:{signal_ts}:{clean_text}:{attachment_id or ''}"
+    if dedupe_key and store.signal_message_seen(dedupe_key):
+        LOGGER.info("Skipping already processed Bluesky Signal message %s", dedupe_key)
+        return
+
     image_path = None
     if attachment_id:
         image_path = await download_signal_attachment(session, attachment_id, attachment_filename, config=config)
-
-    clean_text = incoming_text.replace("/bs", "", 1).strip() if incoming_text else ""
 
     quoted_signal_ts = _extract_signal_quote_id(target_msg)
     reply_ref = None
@@ -692,15 +761,9 @@ async def _handle_bluesky_message(
         else:
             LOGGER.info("Signal reply had quote id %s but no Bluesky mapping found", quoted_signal_ts)
 
-    signal_ts = str(envelope.get("timestamp") or target_msg.get("timestamp") or "")
-    dedupe_key = f"{route.internal_id}:{signal_ts}:{clean_text}:{attachment_id or ''}"
-    if dedupe_key and store.signal_message_seen(dedupe_key):
-        LOGGER.info("Skipping already processed Bluesky Signal message %s", dedupe_key)
-        return
+    status = await bluesky_bot.handle_command(text=clean_text, image_path=image_path, reply_ref=reply_ref)
     if dedupe_key:
         store.mark_signal_message_seen(dedupe_key)
-
-    status = await bluesky_bot.handle_command(text=clean_text, image_path=image_path, reply_ref=reply_ref)
 
     if isinstance(status, str):
         LOGGER.info("BlueskyBot returned legacy status string: %s", status)
@@ -793,6 +856,10 @@ def _internal_id_for(envelope: Mapping[str, Any], target_msg: Mapping[str, Any])
     group_info = target_msg.get("groupInfo", {})
     if isinstance(group_info, Mapping) and group_info.get("groupId"):
         return str(group_info["groupId"])
+    # If it's a syncMessage sent from our client, target recipient is in destination
+    sync_destination = target_msg.get("destination")
+    if sync_destination:
+        return str(sync_destination)
     source = envelope.get("source")
     return str(source) if source else None
 
@@ -813,10 +880,22 @@ async def _dispatch_standard_bot(
     if not reply:
         return
 
-    if route.kind == "nest" and isinstance(reply, tuple) and len(reply) >= 3 and reply[0] == "FILE":
-        await send_signal(session, reply[1], route.recipient, reply[2], config=config)
-    else:
+    if isinstance(reply, BotResponse):
+        await send_signal(
+            session,
+            reply.text,
+            route.recipient,
+            filepath=reply.filepath,
+            quote_timestamp=reply.quote_timestamp,
+            quote_author=reply.quote_author,
+            config=config,
+        )
+    elif route.kind == "nest" and isinstance(reply, tuple) and len(reply) >= 3 and reply[0] == "FILE":
+        await send_signal(session, reply[1], route.recipient, filepath=reply[2], config=config)
+    elif isinstance(reply, str):
         await send_signal(session, reply, route.recipient, config=config)
+    else:
+        LOGGER.warning("Unexpected bot reply type %s from route %s: %r", type(reply).__name__, route.kind, reply)
 
 
 async def _handle_signal_item(
@@ -835,7 +914,7 @@ async def _handle_signal_item(
     if not internal_id:
         LOGGER.debug("Ignoring Signal message without source/group id")
         return
-    if internal_id in SHOPPING_GROUP_INTERNAL_ID:
+    if internal_id in SHOPPING_GROUP_INTERNAL_IDS:
         LOGGER.debug("Ignoring Shopping group message in master bot")
         return
 
@@ -845,16 +924,48 @@ async def _handle_signal_item(
         return
 
     incoming_text = target_msg.get("message") or ""
+    stripped_text = incoming_text.strip()
+    signal_ts = str(envelope.get("timestamp") or target_msg.get("timestamp") or "")
+    sender = str(envelope.get("source") or "")
+
+    attachments = target_msg.get("attachments", [])
+    att_id = ""
+    if isinstance(attachments, list) and attachments:
+        first_att = attachments[0]
+        if isinstance(first_att, Mapping):
+            att_id = str(first_att.get("id") or "")
+
+    # Ingress deduplication across ALL routes (standard bots & bluesky)
+    dedupe_key = f"{route.internal_id}:{sender}:{signal_ts}:{stripped_text}:{att_id}"
+    if dedupe_key and store.signal_message_seen(dedupe_key):
+        LOGGER.info("Skipping already processed Signal message (key=%s, route=%s)", dedupe_key, route.kind)
+        return
+
     LOGGER.info("Incoming message received from %s route=%s", internal_id, route.kind)
 
     if route.kind == "bluesky":
         await _handle_bluesky_message(session, bots["bluesky"], store, envelope, target_msg, route, config=config)
         return
 
-    if not incoming_text or not incoming_text.startswith("/"):
+    if not stripped_text:
         return
+    if not stripped_text.startswith("/"):
+        if route.kind == "nest" and stripped_text.split()[0].lower() in {
+            "pause",
+            "resume",
+            "unpause",
+            "stop",
+            "start",
+            "status",
+            "help",
+        }:
+            pass
+        else:
+            return
 
-    await _dispatch_standard_bot(session, route, incoming_text, bots, config)
+    if dedupe_key:
+        store.mark_signal_message_seen(dedupe_key)
+    await _dispatch_standard_bot(session, route, stripped_text, bots, config)
 
 
 async def master_listener(bots: Mapping[str, Any], store: BridgeStore, config: Optional[AppConfig] = None) -> None:
@@ -862,53 +973,79 @@ async def master_listener(bots: Mapping[str, Any], store: BridgeStore, config: O
     """Stream Signal messages over WebSocket and dispatch them to the right bot."""
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=None)
     backoff_seconds = 2
+    dispatch_queue: asyncio.Queue[Mapping[str, Any]] = asyncio.Queue(maxsize=1000)
+
+    async def _queue_worker(worker_session: aiohttp.ClientSession) -> None:
+        while True:
+            item = await dispatch_queue.get()
+            try:
+                await _handle_signal_item(worker_session, item, bots, store, config)
+            except Exception:
+                LOGGER.exception("Error while processing one Signal payload item from queue")
+            finally:
+                dispatch_queue.task_done()
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        LOGGER.info("Master listener online. Opening WebSocket connection to %s", config.ws_url)
-        while True:
+        worker_task = asyncio.create_task(_queue_worker(session), name="signal_dispatch_worker")
+        try:
+            LOGGER.info("Master listener online. Opening WebSocket connection to %s", config.ws_url)
+            while True:
+                try:
+                    async with session.ws_connect(config.ws_url, heartbeat=30) as ws:
+                        LOGGER.info("WebSocket connected successfully")
+                        backoff_seconds = 2
+
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                for item in _parse_signal_items(msg.data):
+                                    try:
+                                        dispatch_queue.put_nowait(item)
+                                    except asyncio.QueueFull:
+                                        LOGGER.error("Dispatch queue is full; dropping incoming Signal item")
+                            elif msg.type == aiohttp.WSMsgType.ERROR:
+                                LOGGER.error("WebSocket error: %s", ws.exception())
+                                break
+                            elif msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING}:
+                                LOGGER.warning("WebSocket closed by server (%s)", msg.type)
+                                break
+                except asyncio.CancelledError:
+                    raise
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                    LOGGER.error("WebSocket connection dropped/error: %s", exc)
+                except Exception:
+                    LOGGER.exception("Unexpected WebSocket listener error")
+
+                LOGGER.info("Reconnecting WebSocket after %s second(s)", backoff_seconds)
+                await asyncio.sleep(backoff_seconds)
+                backoff_seconds = min(backoff_seconds * 2, 60)
+        finally:
+            worker_task.cancel()
             try:
-                async with session.ws_connect(config.ws_url, heartbeat=30) as ws:
-                    LOGGER.info("WebSocket connected successfully")
-                    backoff_seconds = 2
-
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            for item in _parse_signal_items(msg.data):
-                                try:
-                                    await _handle_signal_item(session, item, bots, store, config)
-                                except Exception:
-                                    LOGGER.exception("Error while processing one Signal payload item")
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            LOGGER.error("WebSocket error: %s", ws.exception())
-                            break
-                        elif msg.type in {aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE}:
-                            LOGGER.warning("WebSocket closed by server")
-                            break
+                await worker_task
             except asyncio.CancelledError:
-                raise
-            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-                LOGGER.error("WebSocket connection dropped/error: %s", exc)
-            except Exception:
-                LOGGER.exception("Unexpected WebSocket listener error")
-
-            LOGGER.info("Reconnecting WebSocket after %s second(s)", backoff_seconds)
-            await asyncio.sleep(backoff_seconds)
-            backoff_seconds = min(backoff_seconds * 2, 60)
+                pass
 
 
 async def _supervise(name: str, task_factory: Callable[[], Awaitable[None]]) -> None:
     """Run a long-lived task and restart it after unexpected crashes."""
     backoff_seconds = 2
     while True:
+        start_time = time.time()
         try:
             LOGGER.info("Starting task: %s", name)
             await task_factory()
-            LOGGER.warning("Task %s exited; restarting after %s second(s)", name, backoff_seconds)
+            uptime = time.time() - start_time
+            if uptime > 120:
+                backoff_seconds = 2
+            LOGGER.warning("Task %s exited (uptime %.1fs); restarting after %s second(s)", name, uptime, backoff_seconds)
         except asyncio.CancelledError:
             LOGGER.info("Task %s cancelled", name)
             raise
         except Exception:
-            LOGGER.exception("Task %s crashed; restarting after %s second(s)", name, backoff_seconds)
+            uptime = time.time() - start_time
+            if uptime > 120:
+                backoff_seconds = 2
+            LOGGER.exception("Task %s crashed (uptime %.1fs); restarting after %s second(s)", name, uptime, backoff_seconds)
         await asyncio.sleep(backoff_seconds)
         backoff_seconds = min(backoff_seconds * 2, 60)
 
@@ -922,6 +1059,21 @@ async def main(config: Optional[AppConfig] = None) -> None:
     if config is None:
         config = load_config()
     CONFIG = config
+
+    loop = asyncio.get_running_loop()
+    shutdown_event = asyncio.Event()
+
+    def _signal_handler() -> None:
+        LOGGER.info("Shutdown signal received")
+        shutdown_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _signal_handler)
+        except (NotImplementedError, RuntimeError):
+            pass
+
+    cleanup_old_attachments(config.attachments_dir)
 
     budget_bot = BudgetBot()
     train_bot = TrainBot()
@@ -966,7 +1118,16 @@ async def main(config: Optional[AppConfig] = None) -> None:
         else:
             LOGGER.info("Bluesky background notification sync disabled; use /notif check or enable BLUESKY_AUTO_SYNC_ENABLED")
 
-        await asyncio.gather(*background_tasks)
+        gather_task = asyncio.gather(*background_tasks)
+        shutdown_waiter = asyncio.create_task(shutdown_event.wait(), name="shutdown_waiter")
+        done, _ = await asyncio.wait([gather_task, shutdown_waiter], return_when=asyncio.FIRST_COMPLETED)
+        if shutdown_event.is_set():
+            LOGGER.info("Shutdown requested. Cancelling background tasks...")
+            gather_task.cancel()
+            try:
+                await gather_task
+            except asyncio.CancelledError:
+                pass
 
 
 if __name__ == "__main__":

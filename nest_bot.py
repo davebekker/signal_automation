@@ -27,6 +27,7 @@ CONFIG_CANDIDATES = (
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "sync_interval_minutes": 30,
+    "paused": False,
     "messaging_enabled": False,
     "state_file": "nest_state.json",
     "download_path": "data/nest_clips",
@@ -100,6 +101,8 @@ def _load_config() -> Dict[str, Any]:
 
     if os.getenv("NEST_SYNC_INTERVAL_MINUTES"):
         config["sync_interval_minutes"] = int(os.getenv("NEST_SYNC_INTERVAL_MINUTES", "30"))
+    if os.getenv("NEST_PAUSED") is not None:
+        config["paused"] = bool(_env_bool("NEST_PAUSED"))
     if os.getenv("NEST_MESSAGING_ENABLED") is not None:
         config["messaging_enabled"] = bool(_env_bool("NEST_MESSAGING_ENABLED"))
 
@@ -170,11 +173,35 @@ class NestBot:
         if not self.username or not self.token:
             logger.warning("Nest Google credentials are missing; Nest sync may fail until configured")
 
-        self.conn = GoogleConnection(self.token, self.username)
-        self.devices = self.conn.get_nest_camera_devices()
         self.state = self.load_state()
+        self.paused = bool(self.state.get("paused", self.config.get("paused", False)))
+        self.conn = GoogleConnection(self.token, self.username)
+        self.devices = []
+        if not self.paused:
+            self._ensure_devices()
+        else:
+            logger.info("Nest sync is currently paused; skipping camera discovery on startup")
         self.recent_events: List[Tuple[dt.datetime, str, str]] = []
         self.manual_sync_trigger = asyncio.Event()
+
+    def _ensure_devices(self) -> None:
+        if self.devices:
+            return
+        try:
+            self.devices = self.conn.get_nest_camera_devices() or []
+        except Exception as exc:
+            logger.error("Failed to fetch Nest camera devices: %s", exc)
+            self.devices = []
+
+    def set_paused(self, paused: bool) -> None:
+        self.paused = paused
+        self.state["paused"] = paused
+        if paused:
+            self.state["paused_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        else:
+            self.state.pop("paused_at", None)
+        self.save_state()
+        self.manual_sync_trigger.set()
 
     def load_state(self) -> Dict[str, Any]:
         if self.state_file.exists():
@@ -380,13 +407,24 @@ class NestBot:
 
     def _last_sync_time(self) -> Optional[dt.datetime]:
         values = []
-        for value in self.state.values():
+        for key, value in self.state.items():
+            if key in {"paused", "paused_at"}:
+                continue
             if isinstance(value, str):
                 try:
                     values.append(dt.datetime.fromisoformat(value))
                 except ValueError:
                     continue
         return max(values) if values else None
+
+    def _paused_at_time(self) -> Optional[dt.datetime]:
+        raw = self.state.get("paused_at")
+        if isinstance(raw, str):
+            try:
+                return dt.datetime.fromisoformat(raw)
+            except ValueError:
+                return None
+        return None
 
     def _status_text(self) -> str:
         pending_count, pending_size = self._pending_summary()
@@ -396,8 +434,14 @@ class NestBot:
         recent_text = f"{recent[1]} at {_format_dt(recent[0])}" if recent else "none this run"
         devices = len(self.devices) if self.devices else 0
         monitored = ", ".join(self.monitored) if self.monitored else "none"
+        paused_at = self._paused_at_time()
+        if self.paused:
+            sync_state = f"⏸️ PAUSED (since {_format_dt(paused_at)})" if paused_at else "⏸️ PAUSED"
+        else:
+            sync_state = f"active (every {self.sync_interval} min)"
         return (
             "🏠 Nest status\n\n"
+            f"Sync state: {sync_state}\n"
             f"Sync interval: {self.sync_interval} min\n"
             f"Signal alerts: {'on' if self.messaging_enabled else 'off'}\n"
             f"Cameras discovered: {devices}\n"
@@ -407,28 +451,56 @@ class NestBot:
             f"Pending local clips: {pending_count} ({_format_bytes(pending_size)})\n"
             f"Last sync marker: {_format_dt(self._last_sync_time())}\n"
             f"Last event seen: {recent_text}\n\n"
-            "Commands: `/sync now`, `/nest status`, `/nest flush`, `/events`, `/get [number]`."
+            "Commands: `/pause`, `/resume`, `/sync now`, `/nest status`, `/nest flush`, `/events`, `/get [number]`."
         )
+
+    def _pause_reply(self) -> str:
+        if self.paused:
+            return "⏸️ Nest camera backup is already paused. Send `/resume` when you want to re-enable it."
+        self.set_paused(True)
+        return "⏸️ Nest camera backup paused. All background syncing is stopped until you send `/resume`."
+
+    def _resume_reply(self) -> str:
+        was_paused = self.paused
+        self.set_paused(False)
+        if was_paused:
+            return "▶️ Nest camera backup resumed! Checking cameras now..."
+        return "▶️ Nest camera backup is already active. Triggered a sync check now."
 
     async def handle_command(self, text):
         parts = text.split()
         if not parts:
             return self._status_text()
         cmd = parts[0].lower()
+        normalized_cmd = cmd if cmd.startswith("/") else f"/{cmd}"
 
-        if cmd == "/sync":
+        if normalized_cmd in {"/pause", "/stop"}:
+            return self._pause_reply()
+
+        if normalized_cmd in {"/resume", "/unpause", "/start"}:
+            return self._resume_reply()
+
+        if normalized_cmd == "/sync":
             if len(parts) > 1:
-                if parts[1].lower() == "now":
+                sub = parts[1].lower()
+                if sub in {"pause", "off", "stop"}:
+                    return self._pause_reply()
+                if sub in {"resume", "unpause", "on", "start"}:
+                    return self._resume_reply()
+                if sub == "now":
+                    if self.paused:
+                        return "⏸️ Nest sync is currently paused. Send `/resume` (or `/sync on`) to re-enable camera backup."
                     self.manual_sync_trigger.set()
                     return "🔄 Manual Nest sync triggered! Checking cameras now..."
                 try:
-                    self.sync_interval = int(parts[1])
+                    self.sync_interval = int(sub)
                     return f"⏳ Nest sync interval updated to {self.sync_interval} minutes."
                 except ValueError:
-                    return "❌ Please provide a valid number of minutes."
-            return f"Nest sync interval is currently {self.sync_interval} minutes."
+                    return "❌ Please provide a valid number of minutes, or use `/sync pause` / `/sync resume`."
+            state_note = " (currently PAUSED)" if self.paused else ""
+            return f"Nest sync interval is currently {self.sync_interval} minutes{state_note}."
 
-        if cmd == "/message":
+        if normalized_cmd == "/message":
             if len(parts) > 1:
                 sub = parts[1].lower()
                 if sub == "on":
@@ -439,20 +511,28 @@ class NestBot:
                     return "🔕 Nest Signal alerts: OFF. Background backup remains active."
             return f"Nest alerts are currently {'ON' if self.messaging_enabled else 'OFF'}."
 
-        if cmd in ["/status", "/nest"]:
+        if normalized_cmd in ["/status", "/nest"]:
             if len(parts) == 1 or (len(parts) > 1 and parts[1].lower() == "status"):
                 return self._status_text()
-            if len(parts) > 1 and parts[1].lower() == "flush":
-                copied, remaining = await self.flush_pending_archives()
-                return f"📦 Nest archive flush complete. Copied: {copied}. Pending: {remaining}."
+            if len(parts) > 1:
+                sub = parts[1].lower()
+                if sub in {"pause", "off", "stop"}:
+                    return self._pause_reply()
+                if sub in {"resume", "unpause", "on", "start"}:
+                    return self._resume_reply()
+                if sub == "flush":
+                    copied, remaining = await self.flush_pending_archives()
+                    return f"📦 Nest archive flush complete. Copied: {copied}. Pending: {remaining}."
 
-        if cmd == "/flush":
+        if normalized_cmd == "/flush":
             copied, remaining = await self.flush_pending_archives()
             return f"📦 Nest archive flush complete. Copied: {copied}. Pending: {remaining}."
 
-        if cmd in ["/usage", "/help"]:
+        if normalized_cmd in ["/usage", "/help"]:
             return (
                 "🏠 Nest Bot\n\n"
+                "• `/pause` (or `/sync off`) - Pause all camera syncing & backups\n"
+                "• `/resume` (or `/sync on`) - Re-enable camera syncing\n"
                 "• `/sync [minutes]` - Show or set camera download interval\n"
                 "• `/sync now` - Trigger a sync immediately\n"
                 "• `/message [on/off]` - Toggle Signal video alerts\n"
@@ -463,7 +543,7 @@ class NestBot:
                 "If Google Drive is unavailable after reboot, clips are staged locally and retried later."
             )
 
-        if cmd == "/events":
+        if normalized_cmd == "/events":
             if not self.recent_events:
                 return "📭 No recent events recorded in this bot run."
             msg = "📹 Recent Nest events\n\n"
@@ -474,7 +554,7 @@ class NestBot:
             msg += "\nUse `/get [number]` for the full clip. ✅ means the bot can currently see the file."
             return msg
 
-        if cmd == "/get" and len(parts) > 1:
+        if normalized_cmd == "/get" and len(parts) > 1:
             try:
                 idx = int(parts[1]) - 1
                 shown = self.recent_events[-10:]
@@ -491,10 +571,21 @@ class NestBot:
     async def sync_task(self, alert_callback):
         """Background sync loop with local staging when Google Drive is unavailable."""
         while True:
+            if self.paused:
+                logger.info("Nest sync is paused; sleeping until resumed")
+                await self.manual_sync_trigger.wait()
+                self.manual_sync_trigger.clear()
+                continue
+
             try:
+                self._ensure_devices()
                 await self.flush_pending_archives()
                 now = dt.datetime.now(dt.timezone.utc)
                 for device in self.devices:
+                    if self.paused:
+                        logger.info("Nest sync paused mid-run; stopping camera check")
+                        break
+
                     d_id = getattr(device, "device_id", device.device_name)
                     if any(ignored in device.device_name for ignored in self.ignored_cameras):
                         continue
@@ -513,6 +604,8 @@ class NestBot:
                     latest_event_time = last_ts
 
                     for event in (events or []):
+                        if self.paused:
+                            break
                         if latest_event_time and event.start_time <= latest_event_time:
                             continue
 
@@ -542,9 +635,13 @@ class NestBot:
                         self.state[d_id] = latest_event_time.isoformat()
                         self.save_state()
 
-                logger.info("Nest Syncing %s cameras...", len(self.devices))
+                if not self.paused:
+                    logger.info("Nest Syncing %s cameras...", len(self.devices))
             except Exception as exc:
                 logger.exception("Nest Sync Error: %s", exc)
+
+            if self.paused:
+                continue
 
             try:
                 await asyncio.wait_for(self.manual_sync_trigger.wait(), timeout=self.sync_interval * 60)
