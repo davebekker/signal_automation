@@ -137,15 +137,49 @@ class BinBot:
 
                                 if summary_list:
                                     rows = summary_list.find_all("div", class_="govuk-summary-list__row")
+                                    raw_date = None
+                                    last_collection = None
+                                    last_collected = None
+
                                     for row in rows:
                                         key = row.find("dt", class_="govuk-summary-list__key")
-                                        if key and "Next collection" in key.get_text():
-                                            value = row.find("dd", class_="govuk-summary-list__value")
-                                            if value:
-                                                raw_date = value.get_text(" ", strip=True).split("(")[0].strip()
-                                                collections.append({"type": bin_name, "date": raw_date})
-                                                logging.info("BinBot: %-22s : %s", bin_name, raw_date)
-                                                break
+                                        value = row.find("dd", class_="govuk-summary-list__value")
+                                        if not key or not value:
+                                            continue
+                                        key_text = key.get_text(strip=True)
+                                        if "Next collection" in key_text:
+                                            raw_date = value.get_text(" ", strip=True).split("(")[0].strip()
+                                        elif "Last collection" in key_text:
+                                            last_raw = value.get_text("\n", strip=True)
+                                            if last_raw:
+                                                first_line = last_raw.splitlines()[0].strip()
+                                                last_collection = " ".join(first_line.split())
+                                                lower_last = last_raw.lower()
+                                                not_left_out = any(
+                                                    phrase in lower_last
+                                                    for phrase in (
+                                                        "not left out",
+                                                        "could not collect",
+                                                        "not put out",
+                                                    )
+                                                )
+                                                last_collected = not not_left_out
+
+                                    if raw_date:
+                                        item = {
+                                            "type": bin_name,
+                                            "date": raw_date,
+                                            "last_collection": last_collection,
+                                            "last_collected": last_collected,
+                                        }
+                                        collections.append(item)
+                                        logging.info(
+                                            "BinBot: %-22s : %s (last_collected=%s, last=%s)",
+                                            bin_name,
+                                            raw_date,
+                                            last_collected,
+                                            last_collection,
+                                        )
                             if collections:
                                 logging.info("BinBot data retrieved successfully on attempt %s", attempt + 1)
                                 return collections
@@ -216,6 +250,36 @@ class BinBot:
         future_dates.sort(key=lambda x: x[0])
         return future_dates
 
+    def _cache_needs_upgrade(self, data):
+        if not data or not isinstance(data, list):
+            return True
+        return any(isinstance(item, dict) and "last_collected" not in item for item in data)
+
+    def format_last_collection_note(self, item):
+        if not isinstance(item, dict):
+            return ""
+        last_collected = item.get("last_collected")
+        if last_collected is None:
+            return ""
+        bin_type = (item.get("type") or "").lower()
+        if "recycling" in bin_type:
+            return "put out last time — can skip if needed" if last_collected else "not put out last time"
+        if "food" in bin_type:
+            return "" if last_collected else "not put out last time"
+        return "put out last time" if last_collected else "not put out last time"
+
+    def format_reminder_lines(self, data, due_types):
+        by_type = {item.get("type"): item for item in (data or []) if isinstance(item, dict)}
+        lines = []
+        for btype in due_types:
+            item = by_type.get(btype, {"type": btype})
+            note = self.format_last_collection_note(item)
+            if note:
+                lines.append(f"• **{btype}** *({note})*")
+            else:
+                lines.append(f"• **{btype}**")
+        return "\n".join(lines)
+
     async def _sleep_until(self, target, label):
         while True:
             now = datetime.now()
@@ -239,10 +303,11 @@ class BinBot:
                 self.prune_state(state)
 
                 data = self.load_cache()
-                if not data:
-                    logging.info("BinBot: Cache empty, performing first-run fetch...")
-                    data = await self.fetch_bin_data()
-                    if data:
+                if not data or self._cache_needs_upgrade(data):
+                    logging.info("BinBot: Cache empty or missing last_collection fields, fetching fresh data...")
+                    fresh = await self.fetch_bin_data()
+                    if fresh:
+                        data = fresh
                         self.save_cache(data)
 
                 if not data:
@@ -264,6 +329,7 @@ class BinBot:
                 next_date, _ = future_dates[0]
                 due_types = [t for d, t in future_dates if d.date() == next_date.date()]
                 items_str = ", ".join(due_types)
+                reminder_lines = self.format_reminder_lines(data, due_types)
                 collection_date = next_date.date()
 
                 night_before, morning_of, refresh_time = self._milestones_for(next_date)
@@ -288,7 +354,7 @@ class BinBot:
                         now = datetime.now()
                     if night_before <= now <= night_grace_until:
                         logging.info("BinBot: Sending Night Before reminder for %s.", collection_date)
-                        await alert_callback(f"🌙 *Night Before* Bin Reminder:\nItems: **{items_str}**")
+                        await alert_callback(f"🌙 *Night Before* Bin Reminder:\n{reminder_lines}")
                         state = self.load_state()
                         self.mark_sent(state, collection_date, "night_before")
                     elif now > night_grace_until:
@@ -302,7 +368,7 @@ class BinBot:
                         now = datetime.now()
                     if morning_of <= now <= morning_grace_until:
                         logging.info("BinBot: Sending Morning Of reminder for %s.", collection_date)
-                        await alert_callback(f"☀️ *Morning Of* Bin Reminder:\nItems: **{items_str}**")
+                        await alert_callback(f"☀️ *Morning Of* Bin Reminder:\n{reminder_lines}")
                         state = self.load_state()
                         self.mark_sent(state, collection_date, "morning_of")
                     elif now > morning_grace_until:
@@ -332,9 +398,9 @@ class BinBot:
             force_refresh = any(arg in text.lower() for arg in ["refresh", "fetch", "reload", "update"])
             data = None if force_refresh else self.load_cache()
 
-            # If cache is missing or contains only expired collections, fetch fresh data
-            if not data or not self.parse_future_dates(data):
-                logging.info("BinBot: Cache missing or expired; fetching fresh bin data...")
+            # If cache is missing, needs upgrade, or contains only expired collections, fetch fresh data
+            if not data or self._cache_needs_upgrade(data) or not self.parse_future_dates(data):
+                logging.info("BinBot: Cache missing, outdated, or expired; fetching fresh bin data...")
                 fresh_data = await self.fetch_bin_data()
                 if fresh_data:
                     data = fresh_data
@@ -345,7 +411,9 @@ class BinBot:
 
             msg = "🚛 **Upcoming Kingston Collections:**\n\n"
             for item in data:
-                msg += f"• **{item['type']}**: {item['date']}\n"
+                note = self.format_last_collection_note(item)
+                note_str = f" *({note})*" if note else ""
+                msg += f"• **{item['type']}**: {item['date']}{note_str}\n"
             return msg
         return None
 

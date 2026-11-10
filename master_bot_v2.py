@@ -920,7 +920,7 @@ async def _handle_signal_item(
 
     route = config.route_for_internal_id(internal_id)
     if not route:
-        LOGGER.info("Ignored message from unknown source: %s", internal_id)
+        LOGGER.debug("Ignored message from unknown source: %s", internal_id)
         return
 
     incoming_text = target_msg.get("message") or ""
